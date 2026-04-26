@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import snowflake.connector
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -26,6 +27,14 @@ def home():
 def health():
     return jsonify({"status": "healthy"})
 
+@app.route('/debug', methods=['POST', 'OPTIONS'])
+def debug():
+    """Debug endpoint to see what data is being sent"""
+    if request.method == "OPTIONS":
+        return "", 200
+    data = request.get_json()
+    return jsonify({"received": data})
+
 @app.route('/writeback', methods=['POST', 'OPTIONS'])
 def writeback():
     if request.method == "OPTIONS":
@@ -35,80 +44,107 @@ def writeback():
         data = request.get_json()
         
         schema = data.get('schema', 'PUBLIC')
-        table = data['table']
-        changes = data['changes']
+        table = data.get('table')
+        
+        if not table:
+            return jsonify({"success": False, "message": "Table name is required"}), 400
+        
+        changes = data.get('changes', [])
+        
+        if not changes:
+            return jsonify({"success": True, "rowsAffected": 0, "message": "No changes to process"})
         
         conn = get_connection()
         cursor = conn.cursor()
         
         rows_affected = 0
-        for change in changes:
-            change_type = change.get('type', 'update')
-            
-            # Get composite key - structure: {columns: [...], values: {...}}
-            composite_key = change.get('compositeKey', {})
-            key_values = composite_key.get('values', {})
-            
-            col = change.get('columnName')
-            val = change.get('newValue')
-            row_data = change.get('rowData', {})
-            
-            if change_type == 'update' and col:
-                # Validate column name
-                if not col.replace('_', '').isalnum():
-                    continue
+        errors = []
+        
+        for i, change in enumerate(changes):
+            try:
+                change_type = change.get('type', 'update')
                 
-                # Build WHERE clause for composite keys
+                # Get composite key - structure: {columns: [...], values: {...}}
+                composite_key = change.get('compositeKey', {})
+                key_columns = composite_key.get('columns', [])
+                key_values = composite_key.get('values', {})
+                
+                col = change.get('columnName')
+                val = change.get('newValue')
+                row_data = change.get('rowData', {})
+                
+                # Build WHERE clause
                 where_parts = []
-                where_values = []
-                for pk_col, pk_val in key_values.items():
-                    where_parts.append(f"{pk_col} = %s")
-                    where_values.append(str(pk_val))  # Convert to string
+                where_params = []
                 
-                if not where_parts:
-                    continue
+                for pk_col in key_columns:
+                    pk_val = key_values.get(pk_col)
+                    if pk_val is not None:
+                        where_parts.append(f'"{pk_col}" = %s')
+                        # Convert value to appropriate type
+                        if isinstance(pk_val, (int, float)):
+                            where_params.append(pk_val)
+                        else:
+                            where_params.append(str(pk_val))
                 
-                where_clause = " AND ".join(where_parts)
-                query = f"UPDATE {schema}.{table} SET {col} = %s WHERE {where_clause}"
-                cursor.execute(query, [val] + where_values)
-                rows_affected += cursor.rowcount
-                
-            elif change_type == 'insert':
-                # Insert new row
-                if row_data:
-                    columns = list(row_data.keys())
-                    values = [str(v) if v is not None else None for v in row_data.values()]
-                    placeholders = ", ".join(["%s"] * len(values))
-                    col_names = ", ".join(columns)
-                    query = f"INSERT INTO {schema}.{table} ({col_names}) VALUES ({placeholders})"
-                    cursor.execute(query, values)
+                if change_type == 'update' and col:
+                    if not where_parts:
+                        errors.append(f"Change {i}: No primary key values for update")
+                        continue
+                    
+                    where_clause = " AND ".join(where_parts)
+                    
+                    # Handle value type
+                    if val is None:
+                        query = f'UPDATE "{schema}"."{table}" SET "{col}" = NULL WHERE {where_clause}'
+                        cursor.execute(query, where_params)
+                    else:
+                        query = f'UPDATE "{schema}"."{table}" SET "{col}" = %s WHERE {where_clause}'
+                        cursor.execute(query, [val] + where_params)
+                    
                     rows_affected += cursor.rowcount
-                
-            elif change_type == 'delete':
-                # Delete row
-                where_parts = []
-                where_values = []
-                for pk_col, pk_val in key_values.items():
-                    where_parts.append(f"{pk_col} = %s")
-                    where_values.append(str(pk_val))
-                
-                if not where_parts:
-                    continue
-                
-                where_clause = " AND ".join(where_parts)
-                query = f"DELETE FROM {schema}.{table} WHERE {where_clause}"
-                cursor.execute(query, where_values)
-                rows_affected += cursor.rowcount
+                    
+                elif change_type == 'insert':
+                    if row_data:
+                        columns = []
+                        values = []
+                        for c, v in row_data.items():
+                            columns.append(f'"{c}"')
+                            values.append(v)
+                        
+                        placeholders = ", ".join(["%s"] * len(values))
+                        col_names = ", ".join(columns)
+                        query = f'INSERT INTO "{schema}"."{table}" ({col_names}) VALUES ({placeholders})'
+                        cursor.execute(query, values)
+                        rows_affected += cursor.rowcount
+                    
+                elif change_type == 'delete':
+                    if not where_parts:
+                        errors.append(f"Change {i}: No primary key values for delete")
+                        continue
+                    
+                    where_clause = " AND ".join(where_parts)
+                    query = f'DELETE FROM "{schema}"."{table}" WHERE {where_clause}'
+                    cursor.execute(query, where_params)
+                    rows_affected += cursor.rowcount
+                    
+            except Exception as e:
+                errors.append(f"Change {i}: {str(e)}")
         
         conn.commit()
         cursor.close()
         conn.close()
         
-        return jsonify({
+        result = {
             "success": True,
             "rowsAffected": rows_affected,
             "message": f"Processed {rows_affected} row(s)"
-        })
+        }
+        
+        if errors:
+            result["warnings"] = errors
+        
+        return jsonify(result)
         
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
