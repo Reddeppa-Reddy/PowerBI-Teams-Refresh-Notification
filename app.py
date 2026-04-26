@@ -36,7 +36,8 @@ def writeback():
         
         schema = data.get('schema', 'PUBLIC')
         table = data['table']
-        pk_column = data['primaryKeyColumn']
+        # Support both single and multiple primary key columns
+        pk_columns = data.get('primaryKeyColumns') or [data.get('primaryKeyColumn')]
         changes = data['changes']
         
         conn = get_connection()
@@ -44,16 +45,54 @@ def writeback():
         
         rows_affected = 0
         for change in changes:
-            pk = change['primaryKey']
-            col = change['columnName']
-            val = change['newValue']
+            change_type = change.get('type', 'update')
             
-            if not col.replace('_', '').isalnum():
-                continue
+            # Get primary key value(s) - support both formats
+            composite_key = change.get('compositeKey') or {pk_columns[0]: change.get('primaryKey')}
             
-            query = f"UPDATE {schema}.{table} SET {col} = %s WHERE {pk_column} = %s"
-            cursor.execute(query, (val, pk))
-            rows_affected += cursor.rowcount
+            col = change.get('columnName')
+            val = change.get('newValue')
+            row_data = change.get('rowData', {})
+            
+            if change_type == 'update' and col:
+                # Validate column name
+                if not col.replace('_', '').isalnum():
+                    continue
+                
+                # Build WHERE clause for composite keys
+                where_parts = []
+                where_values = []
+                for pk_col, pk_val in composite_key.items():
+                    where_parts.append(f"{pk_col} = %s")
+                    where_values.append(pk_val)
+                
+                where_clause = " AND ".join(where_parts)
+                query = f"UPDATE {schema}.{table} SET {col} = %s WHERE {where_clause}"
+                cursor.execute(query, [val] + where_values)
+                rows_affected += cursor.rowcount
+                
+            elif change_type == 'insert':
+                # Insert new row
+                columns = list(row_data.keys())
+                values = list(row_data.values())
+                placeholders = ", ".join(["%s"] * len(values))
+                col_names = ", ".join(columns)
+                query = f"INSERT INTO {schema}.{table} ({col_names}) VALUES ({placeholders})"
+                cursor.execute(query, values)
+                rows_affected += cursor.rowcount
+                
+            elif change_type == 'delete':
+                # Delete row
+                where_parts = []
+                where_values = []
+                for pk_col, pk_val in composite_key.items():
+                    where_parts.append(f"{pk_col} = %s")
+                    where_values.append(pk_val)
+                
+                where_clause = " AND ".join(where_parts)
+                query = f"DELETE FROM {schema}.{table} WHERE {where_clause}"
+                cursor.execute(query, where_values)
+                rows_affected += cursor.rowcount
         
         conn.commit()
         cursor.close()
@@ -62,7 +101,7 @@ def writeback():
         return jsonify({
             "success": True,
             "rowsAffected": rows_affected,
-            "message": f"Updated {rows_affected} row(s)"
+            "message": f"Processed {rows_affected} row(s)"
         })
         
     except Exception as e:
