@@ -36,8 +36,6 @@ def writeback():
         
         schema = data.get('schema', 'PUBLIC')
         table = data['table']
-        # Support both single and multiple primary key columns
-        pk_columns = data.get('primaryKeyColumns') or [data.get('primaryKeyColumn')]
         changes = data['changes']
         
         conn = get_connection()
@@ -47,8 +45,9 @@ def writeback():
         for change in changes:
             change_type = change.get('type', 'update')
             
-            # Get primary key value(s) - support both formats
-            composite_key = change.get('compositeKey') or {pk_columns[0]: change.get('primaryKey')}
+            # Get composite key - structure: {columns: [...], values: {...}}
+            composite_key = change.get('compositeKey', {})
+            key_values = composite_key.get('values', {})
             
             col = change.get('columnName')
             val = change.get('newValue')
@@ -62,9 +61,12 @@ def writeback():
                 # Build WHERE clause for composite keys
                 where_parts = []
                 where_values = []
-                for pk_col, pk_val in composite_key.items():
+                for pk_col, pk_val in key_values.items():
                     where_parts.append(f"{pk_col} = %s")
-                    where_values.append(pk_val)
+                    where_values.append(str(pk_val))  # Convert to string
+                
+                if not where_parts:
+                    continue
                 
                 where_clause = " AND ".join(where_parts)
                 query = f"UPDATE {schema}.{table} SET {col} = %s WHERE {where_clause}"
@@ -73,21 +75,25 @@ def writeback():
                 
             elif change_type == 'insert':
                 # Insert new row
-                columns = list(row_data.keys())
-                values = list(row_data.values())
-                placeholders = ", ".join(["%s"] * len(values))
-                col_names = ", ".join(columns)
-                query = f"INSERT INTO {schema}.{table} ({col_names}) VALUES ({placeholders})"
-                cursor.execute(query, values)
-                rows_affected += cursor.rowcount
+                if row_data:
+                    columns = list(row_data.keys())
+                    values = [str(v) if v is not None else None for v in row_data.values()]
+                    placeholders = ", ".join(["%s"] * len(values))
+                    col_names = ", ".join(columns)
+                    query = f"INSERT INTO {schema}.{table} ({col_names}) VALUES ({placeholders})"
+                    cursor.execute(query, values)
+                    rows_affected += cursor.rowcount
                 
             elif change_type == 'delete':
                 # Delete row
                 where_parts = []
                 where_values = []
-                for pk_col, pk_val in composite_key.items():
+                for pk_col, pk_val in key_values.items():
                     where_parts.append(f"{pk_col} = %s")
-                    where_values.append(pk_val)
+                    where_values.append(str(pk_val))
+                
+                if not where_parts:
+                    continue
                 
                 where_clause = " AND ".join(where_parts)
                 query = f"DELETE FROM {schema}.{table} WHERE {where_clause}"
