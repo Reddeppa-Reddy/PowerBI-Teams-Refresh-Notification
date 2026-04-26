@@ -11,7 +11,7 @@ SNOWFLAKE_CONFIG = {
     "account": "pcxtnvv-ty06666",
     "user": "REDDEPAAREDDY117A",
     "password": "8686808462aA#aA",
-    "warehouse": "COMPUTER_WH",
+    "warehouse": "COMPUTE_WH",
     "database": "WRITEBACK",
     "role": "ACCOUNTADMIN"
 }
